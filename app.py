@@ -112,114 +112,98 @@ sp = get_spotify_client()
 if not sp:
     st.stop()
 
-# --- セッションステートの初期化 ---
-if "text" not in st.session_state:
-    st.session_state.text = ""
-if "audio_emotion" not in st.session_state:
-    st.session_state.audio_emotion = None
-if "text_emotion" not in st.session_state:
-    st.session_state.text_emotion = None
-
 input_mode = st.radio("音声入力方法を選んでください：", ["🎙️ マイクで話す", "📁 音声ファイルをアップロード"], horizontal=True, key="input_mode")
 
-# --- マイク入力モード ---
+# --- 結果表示エリアを先に定義 ---
+st.markdown("---")
+st.header("分析結果")
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.subheader("🗣️ 文字起こし結果")
+    text_display = st.empty()
+with col2:
+    st.subheader("🔊 音声の感情")
+    audio_emotion_display = st.empty()
+with col3:
+    st.subheader("📝 テキストの感情")
+    text_emotion_display = st.empty()
+
+st.markdown("---")
+playlist_display = st.container()
+
+# --- 録音/アップロード処理 ---
 if input_mode == "🎙️ マイクで話す":
-    st.info("1. STARTを押す → 2. マイクを許可する → 3. 話す → 4. STOPを押すと分析が始まります。")
-
-    if "audio_frames" not in st.session_state:
-        st.session_state.audio_frames = []
-
-    def audio_frame_callback(frame: av.AudioFrame):
-        st.session_state.audio_frames.append(frame.to_ndarray())
-        print(f"★DEBUG: Audio frame received. Total frames: {len(st.session_state.audio_frames)}")
-
+    st.info("1. STARTを押す → 2. 話す → 3. STOPを押す")
+    
     webrtc_ctx = webrtc_streamer(
         key="audio-recorder",
         mode=WebRtcMode.SENDONLY,
-        audio_frame_callback=audio_frame_callback,
+        audio_receiver_size=2048,
         media_stream_constraints={"video": False, "audio": True},
-        # audio_receiver_sizeを大きくしてQueue overflowを防ぐ
-        audio_receiver_size=4096, 
     )
 
-    status_indicator = st.empty()
-
-    if webrtc_ctx.state.playing:
-        status_indicator.info("🎙️ 録音中...")
-        # 録音が始まったら、前の録音データをクリアする
-        if "analysis_done" not in st.session_state or st.session_state.analysis_done == True:
-             st.session_state.audio_frames = []
-             st.session_state.analysis_done = False
-    else:
-        status_indicator.info("▶️ 『START』で録音開始")
-        
-        # --- 録音停止後の処理 ---
-        if "analysis_done" in st.session_state and not st.session_state.analysis_done and len(st.session_state.audio_frames) > 0:
+    if not webrtc_ctx.state.playing:
+        # STOPが押された後、または初期状態
+        if "audio_buffer" in st.session_state and len(st.session_state.audio_buffer) > 0:
             with st.spinner("音声データを処理・分析しています..."):
-                frames = st.session_state.audio_frames
+                final_waveform = np.concatenate(st.session_state.audio_buffer)
                 
-                sound_chunks = [frame.mean(axis=1) for frame in frames]
-                final_waveform = np.concatenate(sound_chunks)
-                
+                # リサンプリング
                 resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
                 final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()
+
+                # 分析実行
+                text = transcribe_audio(final_waveform_16k, models)
+                audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
+                text_emotion = analyze_text_emotion(text, models) if text else None
+
+                # 結果表示
+                text_display.write(text or "（なし）")
+                if audio_emotion:
+                    audio_emotion_display.success(f"**{audio_emotion[0]['label']}** ({audio_emotion[0]['score']:.2f})")
+                if text_emotion:
+                    text_emotion_display.success(f"**{text_emotion[0]['label']}** ({text_emotion[0]['score']:.2f})")
                 
-                st.session_state.text = transcribe_audio(final_waveform_16k, models)
-                st.session_state.audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
-                if st.session_state.text:
-                    st.session_state.text_emotion = analyze_text_emotion(st.session_state.text, models)
+                primary_emotion_label = audio_emotion[0]['label'] if audio_emotion else (text_emotion[0]['label'] if text_emotion else None)
+                if primary_emotion_label:
+                    with playlist_display:
+                         search_spotify(primary_emotion_label, sp)
 
-            st.session_state.audio_frames = []
-            st.session_state.analysis_done = True
-            st.rerun()
+            # 処理が終わったらバッファをクリア
+            st.session_state.audio_buffer = [] 
+    else:
+        # 録音開始時にバッファを初期化
+        if "audio_buffer" not in st.session_state or len(st.session_state.get("audio_buffer", [])) > 0:
+            st.session_state.audio_buffer = []
 
-# --- アップロード音声モード ---
+        st.info("🎙️ 録音中... 停止すると分析が始まります。")
+        
+        # 音声フレームをバッファに溜める
+        try:
+            frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
+            for frame in frames:
+                st.session_state.audio_buffer.append(frame.to_ndarray().mean(axis=1))
+        except queue.Empty:
+            pass
+
 elif input_mode == "📁 音声ファイルをアップロード":
     uploaded_file = st.file_uploader("音声ファイル(mp3, wav) をアップロードしてください", type=["wav", "mp3"])
 
     if uploaded_file:
         with st.spinner("音声ファイルを処理・分析しています..."):
-            try:
-                waveform, _ = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
-                st.session_state.text = transcribe_audio(waveform, models)
-                st.session_state.audio_emotion = analyze_audio_emotion(waveform, RECORDING_SAMPLING_RATE, models)
-                if st.session_state.text:
-                    st.session_state.text_emotion = analyze_text_emotion(st.session_state.text, models)
-            except Exception as e:
-                st.error(f"ファイル処理中にエラーが発生しました: {e}")
-        st.rerun()
-
-# --- 結果表示 ---
-if st.session_state.text or st.session_state.audio_emotion:
-    st.markdown("---")
-    st.header("分析結果")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.subheader("🗣️ 文字起こし結果")
-        st.write(st.session_state.text or "（なし）")
-    with col2:
-        st.subheader("🔊 音声の感情")
-        if st.session_state.audio_emotion:
-            primary_emotion = st.session_state.audio_emotion[0]
-            st.success(f"**{primary_emotion['label']}** ({primary_emotion['score']:.2f})")
-    with col3:
-        st.subheader("📝 テキストの感情")
-        if st.session_state.text_emotion:
-            primary_emotion = st.session_state.text_emotion[0]
-            st.success(f"**{primary_emotion['label']}** ({primary_emotion['score']:.2f})")
-    
-    st.markdown("---")
-    primary_emotion_label = None
-    if st.session_state.get("audio_emotion"):
-        primary_emotion_label = st.session_state["audio_emotion"][0]["label"]
-    elif st.session_state.get("text_emotion"):
-        primary_emotion_label = st.session_state["text_emotion"][0]["label"]
-    if primary_emotion_label and sp:
-        search_spotify(primary_emotion_label, sp)
-
-    # 結果をクリアするためのボタン
-    if st.button("結果をクリア"):
-        st.session_state.text = ""
-        st.session_state.audio_emotion = None
-        st.session_state.text_emotion = None
-        st.rerun()
+            waveform, _ = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
+            text = transcribe_audio(waveform, models)
+            audio_emotion = analyze_audio_emotion(waveform, RECORDING_SAMPLING_RATE, models)
+            text_emotion = analyze_text_emotion(text, models) if text else None
+            
+            # 結果表示
+            text_display.write(text or "（なし）")
+            if audio_emotion:
+                audio_emotion_display.success(f"**{audio_emotion[0]['label']}** ({audio_emotion[0]['score']:.2f})")
+            if text_emotion:
+                text_emotion_display.success(f"**{text_emotion[0]['label']}** ({text_emotion[0]['score']:.2f})")
+            
+            primary_emotion_label = audio_emotion[0]['label'] if audio_emotion else (text_emotion[0]['label'] if text_emotion else None)
+            if primary_emotion_label:
+                with playlist_display:
+                    search_spotify(primary_emotion_label, sp)

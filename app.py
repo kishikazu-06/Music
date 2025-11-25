@@ -192,6 +192,9 @@ if input_mode == "🎙️ マイクで話す":
             with st.spinner("音声を分析しています..."):
                 final_waveform = np.concatenate(st.session_state.audio_buffer)
 
+                # ★ ここに追加（録音が短すぎる場合の防止）
+                final_waveform = force_min_length(final_waveform, target_length=48000)  # 1秒ぶんを保証
+
                 # リサンプリング
                 resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
                 final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()

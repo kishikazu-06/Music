@@ -248,6 +248,7 @@ if input_mode == "🎙️ マイクで話す":
                 resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
                 final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()
                 st.write(f"Resampled waveform shape: {final_waveform_16k.shape}, dtype: {final_waveform_16k.dtype}")
+                st.write(f"Resampled waveform stats: min={final_waveform_16k.min():.4f}, max={final_waveform_16k.max():.4f}, mean={final_waveform_16k.mean():.4f}, std={final_waveform_16k.std():.4f}")
 
                 final_waveform_16k = force_min_length(final_waveform_16k)
                 st.write(f"After force_min_length waveform shape: {final_waveform_16k.shape}")
@@ -307,9 +308,13 @@ else:
     if uploaded_file:
         with st.spinner("音声を分析しています..."):
             waveform, _ = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
-            waveform = force_min_length(waveform)
             st.write("--- Debug Info (ファイルアップロード) ---")
-            st.write(f"Uploaded waveform shape: {waveform.shape}, dtype: {waveform.dtype}")
+            st.write(f"Uploaded waveform shape (before force_min_length): {waveform.shape}, dtype: {waveform.dtype}")
+            st.write(f"Uploaded waveform stats (before force_min_length): min={waveform.min():.4f}, max={waveform.max():.4f}, mean={waveform.mean():.4f}, std={waveform.std():.4f}")
+
+            waveform = force_min_length(waveform)
+            st.write(f"Uploaded waveform shape (after force_min_length): {waveform.shape}")
+            st.write(f"Uploaded waveform stats (after force_min_length): min={waveform.min():.4f}, max={waveform.max():.4f}, mean={waveform.mean():.4f}, std={waveform.std():.4f}")
 
             st.write("Calling transcribe_audio...")
             text = transcribe_audio(waveform, models)

@@ -1,17 +1,15 @@
 import streamlit as st
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
 import numpy as np
 import torch
 import torchaudio
 import librosa
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification, AutoTokenizer, AutoModelForSequenceClassification
 from faster_whisper import WhisperModel
-import av
 import os
 import queue
-import time
 
 # ==========================
 # 定数と設定
@@ -23,6 +21,20 @@ AUDIO_EMOTION_MODEL_NAME = "superb/hubert-base-superb-er"
 TEXT_EMOTION_MODEL_NAME = "cardiffnlp/twitter-roberta-base-emotion"
 WHISPER_MODEL_NAME = "base"
 RECORDING_SAMPLING_RATE = 16000
+MIN_AUDIO_LEN = 16000  # 1秒の波形
+
+# ==========================
+# ユーティリティ
+# ==========================
+def force_min_length(waveform, target_length=MIN_AUDIO_LEN):
+    """波形を最低長にパディングして Hubert を壊さないようにする"""
+    length = len(waveform)
+    if length == 0:
+        return np.zeros(target_length, dtype=np.float32)
+    if length < target_length:
+        pad = target_length - length
+        return np.concatenate([waveform, np.zeros(pad, dtype=np.float32)])
+    return waveform
 
 # ==========================
 # AIモデルのロード
@@ -49,33 +61,43 @@ def load_models():
 def analyze_audio_emotion(waveform, sampling_rate, models):
     feature_extractor = models["audio_feature_extractor"]
     model = models["audio_model"]
+
+    # 必ず numpy → list にして渡す（Hubert 仕様）
     if sampling_rate != feature_extractor.sampling_rate:
         waveform = librosa.resample(waveform, orig_sr=sampling_rate, target_sr=feature_extractor.sampling_rate)
 
-    # Pre-process the waveform using the feature extractor
-    inputs = feature_extractor(waveform, sampling_rate=feature_extractor.sampling_rate, return_tensors="pt", padding=True)
+    waveform = force_min_length(waveform)  # ★ 短すぎる音声を救済
 
-    # The feature extractor likely returns a tensor of shape (batch, sequence_length).
-    # The model's conv1d layer expects (batch_size, num_channels, sequence_length).
-    # We need to add a channel dimension if it's missing.
-    if hasattr(inputs, "input_values") and inputs.input_values.ndim == 2:
-        inputs.input_values = inputs.input_values.unsqueeze(1)
+    inputs = feature_extractor(
+        waveform,
+        sampling_rate=feature_extractor.sampling_rate,
+        return_tensors="pt",
+        padding=True,
+    )
 
+    # ★ Hubert は [batch, seq] 形式でOK → unsqueeze(1) は絶対に要らない
     with torch.no_grad():
         logits = model(**inputs).logits
     scores = torch.nn.functional.softmax(logits, dim=-1)
-    predictions = [{"label": model.config.id2label[i], "score": score.item()} for i, score in enumerate(scores[0])]
-    return sorted(predictions, key=lambda x: x["score"], reverse=True)
+
+    return [
+        {"label": model.config.id2label[i], "score": scores[0][i].item()}
+        for i in range(scores.shape[1])
+    ]
 
 def analyze_text_emotion(text, models):
     tokenizer = models["text_tokenizer"]
     model = models["text_model"]
     inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+
     with torch.no_grad():
         logits = model(**inputs).logits
+
     scores = torch.nn.functional.softmax(logits, dim=-1)
-    predictions = [{"label": model.config.id2label[i], "score": score.item()} for i, score in enumerate(scores[0])]
-    return sorted(predictions, key=lambda x: x["score"], reverse=True)
+    return [
+        {"label": model.config.id2label[i], "score": scores[0][i].item()}
+        for i in range(scores.shape[1])
+    ]
 
 def transcribe_audio(waveform, models, lang="ja"):
     model = models["whisper_model"]
@@ -93,15 +115,26 @@ def get_spotify_client():
         st.error(f"Spotifyへの接続に失敗しました: {e}")
         return None
 
-EMOTION_KEYWORD_MAP = {"ang": "怒り, angry", "hap": "楽しい, happy", "neu": "落ち着く, neutral", "sad": "悲しい, sad", "joy": "喜び, joy", "optimism": "ポジティブ, positive", "anger": "怒り, angry", "sadness": "悲しみ, sad"}
+EMOTION_KEYWORD_MAP = {
+    "ang": "怒り, angry",
+    "hap": "楽しい, happy",
+    "neu": "落ち着く, neutral",
+    "sad": "悲しい, sad",
+    "joy": "喜び, joy",
+    "optimism": "ポジティブ, positive",
+    "anger": "怒り, angry",
+    "sadness": "悲しみ, sad",
+}
 
 def search_spotify(emotion_label, sp):
     query = EMOTION_KEYWORD_MAP.get(emotion_label, emotion_label)
     st.subheader(f"🎧 「{emotion_label}」({query}) に関連するプレイリスト")
     results = sp.search(q=f"{query} プレイリスト", type="playlist", limit=5, market="JP")
+
     if not results["playlists"]["items"]:
         st.write("見つかりませんでした")
         return
+
     for playlist in results["playlists"]["items"]:
         col1, col2 = st.columns([1, 4])
         with col1:
@@ -121,12 +154,13 @@ sp = get_spotify_client()
 if not sp:
     st.stop()
 
-input_mode = st.radio("音声入力方法を選んでください：", ["🎙️ マイクで話す", "📁 音声ファイルをアップロード"], horizontal=True, key="input_mode")
+input_mode = st.radio("音声入力方法を選んでください：", ["🎙️ マイクで話す", "📁 音声ファイルをアップロード"], horizontal=True)
 
-# --- 結果表示エリアを先に定義 ---
+# --- 結果表示エリア ---
 st.markdown("---")
 st.header("分析結果")
 col1, col2, col3 = st.columns(3)
+
 with col1:
     st.subheader("🗣️ 文字起こし結果")
     text_display = st.empty()
@@ -140,10 +174,12 @@ with col3:
 st.markdown("---")
 playlist_display = st.container()
 
-# --- 録音/アップロード処理 ---
+# ==========================
+# 録音 or アップロード
+# ==========================
 if input_mode == "🎙️ マイクで話す":
-    st.info("1. STARTを押す → 2. 話す → 3. STOPを押す")
-    
+    st.info("1. START → 2. 話す → 3. STOP で分析")
+
     webrtc_ctx = webrtc_streamer(
         key="audio-recorder",
         mode=WebRtcMode.SENDONLY,
@@ -152,67 +188,88 @@ if input_mode == "🎙️ マイクで話す":
     )
 
     if not webrtc_ctx.state.playing:
-        # STOPが押された後、または初期状態
         if "audio_buffer" in st.session_state and len(st.session_state.audio_buffer) > 0:
-            with st.spinner("音声データを処理・分析しています..."):
+            with st.spinner("音声を分析しています..."):
                 final_waveform = np.concatenate(st.session_state.audio_buffer)
-                
+
                 # リサンプリング
                 resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
                 final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()
 
-                # 分析実行
+                final_waveform_16k = force_min_length(final_waveform_16k)
+
+                # 分析
                 text = transcribe_audio(final_waveform_16k, models)
                 audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
                 text_emotion = analyze_text_emotion(text, models) if text else None
 
-                # 結果表示
+                # 表示
                 text_display.write(text or "（なし）")
                 if audio_emotion:
-                    audio_emotion_display.success(f"**{audio_emotion[0]['label']}** ({audio_emotion[0]['score']:.2f})")
+                    top = max(audio_emotion, key=lambda x: x["score"])
+                    audio_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
                 if text_emotion:
-                    text_emotion_display.success(f"**{text_emotion[0]['label']}** ({text_emotion[0]['score']:.2f})")
-                
-                primary_emotion_label = audio_emotion[0]['label'] if audio_emotion else (text_emotion[0]['label'] if text_emotion else None)
-                if primary_emotion_label:
-                    with playlist_display:
-                         search_spotify(primary_emotion_label, sp)
+                    top = max(text_emotion, key=lambda x: x["score"])
+                    text_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
 
-            # 処理が終わったらバッファをクリア
-            st.session_state.audio_buffer = [] 
+                primary = (
+                    max(audio_emotion, key=lambda x: x["score"])["label"]
+                    if audio_emotion else (
+                        max(text_emotion, key=lambda x: x["score"])["label"]
+                        if text_emotion else None
+                    )
+                )
+                if primary:
+                    with playlist_display:
+                        search_spotify(primary, sp)
+
+            st.session_state.audio_buffer = []  # クリア
     else:
-        # 録音開始時にバッファを初期化
-        if "audio_buffer" not in st.session_state or len(st.session_state.get("audio_buffer", [])) > 0:
+        # 録音中
+        if "audio_buffer" not in st.session_state:
             st.session_state.audio_buffer = []
 
-        st.info("🎙️ 録音中... 停止すると分析が始まります。")
-        
-        # 音声フレームをバッファに溜める
+        st.info("🎙️ 録音中... STOPで分析開始")
+
         try:
             frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
             for frame in frames:
-                st.session_state.audio_buffer.append(frame.to_ndarray().mean(axis=1))
+                arr = frame.to_ndarray()
+                if arr.ndim == 2:  # (samples, channels)
+                    mono = arr.mean(axis=1)
+                else:
+                    mono = arr
+                st.session_state.audio_buffer.append(mono.astype(np.float32))
         except queue.Empty:
             pass
 
-elif input_mode == "📁 音声ファイルをアップロード":
-    uploaded_file = st.file_uploader("音声ファイル(mp3, wav) をアップロードしてください", type=["wav", "mp3"])
+else:
+    uploaded_file = st.file_uploader("音声ファイル(mp3, wav) をアップロード", type=["wav", "mp3"])
 
     if uploaded_file:
-        with st.spinner("音声ファイルを処理・分析しています..."):
+        with st.spinner("音声を分析しています..."):
             waveform, _ = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
+            waveform = force_min_length(waveform)
+
             text = transcribe_audio(waveform, models)
             audio_emotion = analyze_audio_emotion(waveform, RECORDING_SAMPLING_RATE, models)
             text_emotion = analyze_text_emotion(text, models) if text else None
-            
-            # 結果表示
+
             text_display.write(text or "（なし）")
             if audio_emotion:
-                audio_emotion_display.success(f"**{audio_emotion[0]['label']}** ({audio_emotion[0]['score']:.2f})")
+                top = max(audio_emotion, key=lambda x: x["score"])
+                audio_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
             if text_emotion:
-                text_emotion_display.success(f"**{text_emotion[0]['label']}** ({text_emotion[0]['score']:.2f})")
-            
-            primary_emotion_label = audio_emotion[0]['label'] if audio_emotion else (text_emotion[0]['label'] if text_emotion else None)
-            if primary_emotion_label:
+                top = max(text_emotion, key=lambda x: x["score"])
+                text_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
+
+            primary = (
+                max(audio_emotion, key=lambda x: x["score"])["label"]
+                if audio_emotion else (
+                    max(text_emotion, key=lambda x: x["score"])["label"]
+                    if text_emotion else None
+                )
+            )
+            if primary:
                 with playlist_display:
-                    search_spotify(primary_emotion_label, sp)
+                    search_spotify(primary, sp)

@@ -1,0 +1,3 @@
+Spotify API
+Client ID：ff259b9ec7f3420381662c278fed342f
+Client secret：a35403dc7fb64531ba6a98c5794fcef8

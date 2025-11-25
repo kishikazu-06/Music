@@ -1,0 +1,7 @@
+streamlit
+spotipy
+SpeechRecognition
+streamlit-webrtc
+av
+openai>=1.0.0
+pydub

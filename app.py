@@ -51,7 +51,12 @@ def analyze_audio_emotion(waveform, sampling_rate, models):
     model = models["audio_model"]
     if sampling_rate != feature_extractor.sampling_rate:
         waveform = librosa.resample(waveform, orig_sr=sampling_rate, target_sr=feature_extractor.sampling_rate)
-    inputs = feature_extractor([waveform], sampling_rate=feature_extractor.sampling_rate, return_tensors="pt", padding=True)
+    # Convert numpy array to 2D PyTorch tensor (batch_size, sequence_length)
+    torch_waveform = torch.from_numpy(waveform).float()
+    if torch_waveform.ndim == 1:
+        torch_waveform = torch_waveform.unsqueeze(0)
+
+    inputs = feature_extractor(torch_waveform, sampling_rate=feature_extractor.sampling_rate, return_tensors="pt", padding=True)
     with torch.no_grad():
         logits = model(**inputs).logits
     scores = torch.nn.functional.softmax(logits, dim=-1)

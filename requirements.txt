@@ -5,3 +5,10 @@ streamlit-webrtc
 av
 openai>=1.0.0
 pydub
+transformers
+torch
+torchaudio
+librosa
+soundfile
+faster-whisper
+numpy

@@ -10,6 +10,7 @@ from transformers import AutoFeatureExtractor, AutoModelForAudioClassification, 
 from faster_whisper import WhisperModel
 import av
 import time
+import queue
 import tempfile
 import os
 import soundfile as sf
@@ -175,70 +176,109 @@ if "text_emotion" not in st.session_state:
 # ==========================
 # 🎤 マイク入力モード
 # ==========================
+import queue
+
+# ==========================
+# 🎤 マイク入力モード
+# ==========================
 if input_mode == "🎙️ マイクで話す":
-    st.info("下の『START』ボタンを押してマイクに向かって話してください。話をやめると自動で分析が始まります。")
+    st.info("下の『START』ボタンを押してマイクに向かって話してください。話した内容がリアルタイムでテキスト化されます。")
+
+    audio_frames_queue = queue.Queue()
+
+    def audio_frame_callback(frame: av.AudioFrame):
+        audio_frames_queue.put(frame.to_ndarray())
 
     webrtc_ctx = webrtc_streamer(
-        key="speech-to-text",
+        key="speech-to-text-realtime",
         mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=1024,
+        audio_frame_callback=audio_frame_callback,
         media_stream_constraints={"video": False, "audio": True},
         rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
     )
 
     status_indicator = st.empty()
+    realtime_text_display = st.empty()
 
-    if not webrtc_ctx.state.playing:
-        st.session_state["text"] = ""
-        st.session_state["audio_emotion"] = None
-        st.session_state["text_emotion"] = None
+    if "realtime_text" not in st.session_state:
+        st.session_state["realtime_text"] = ""
+    if "final_audio_data" not in st.session_state:
+        st.session_state["final_audio_data"] = None
 
-    if webrtc_ctx.audio_receiver:
-        status_indicator.info("マイクで話してください...")
+    # --- リアルタイム処理 ---
+    if webrtc_ctx.state.playing:
+        status_indicator.info("🎙️ 録音中... 話してください。")
         
-        sound_chunk = st.empty()
-        
-        try:
-            audio_frames = []
-            last_received_time = time.time()
+        if "audio_buffer" not in st.session_state:
+            st.session_state["audio_buffer"] = np.array([], dtype=np.float32)
+        if "all_frames" not in st.session_state:
+            st.session_state["all_frames"] = []
 
-            while True:
-                try:
-                    frame = webrtc_ctx.audio_receiver.get_frame(timeout=1)
-                    audio_frames.append(frame)
-                    last_received_time = time.time()
-                except av.error.TimeoutError:
-                    current_time = time.time()
-                    if current_time - last_received_time > RECORDING_TIMEOUT_SECONDS:
-                        status_indicator.info("音声が途絶えたため、分析を開始します。")
-                        break
+        # リアルタイム文字起こし用のループ
+        while webrtc_ctx.state.playing:
+            try:
+                frame_data = audio_frames_queue.get(timeout=1.0)
+                
+                # モノラルに変換
+                sound_chunk = frame_data.mean(axis=1) 
+                st.session_state.audio_buffer = np.append(st.session_state.audio_buffer, sound_chunk)
+                st.session_state.all_frames.append(sound_chunk)
+
+                # 1.5秒ごとに部分的な文字起こしを実行
+                if len(st.session_state.audio_buffer) > RECORDING_SAMPLING_RATE * 1.5:
+                    # サンプリングレート変換
+                    resampler = torchaudio.transforms.Resample(
+                        orig_freq=webrtc_ctx.audio_receiver.format.sample_rate, 
+                        new_freq=RECORDING_SAMPLING_RATE
+                    )
+                    waveform_16k = resampler(torch.from_numpy(st.session_state.audio_buffer).float()).numpy()
+                    
+                    # 文字起こし
+                    text = transcribe_audio(waveform_16k, models)
+                    st.session_state.realtime_text = text
+                    realtime_text_display.markdown(f"**リアルタイム:** {text}")
+                    
+                    # バッファをクリア
+                    st.session_state.audio_buffer = np.array([], dtype=np.float32)
+
+            except queue.Empty:
+                # タイムアウトしてもループを続ける
+                continue
+        
+        # --- 録音停止後の最終処理 ---
+        status_indicator.info("録音停止。最終分析を実行しています...")
+        
+        # これまでに収集したすべてのフレームを結合
+        if st.session_state.all_frames:
+            final_waveform = np.concatenate(st.session_state.all_frames)
             
-            if audio_frames:
-                status_indicator.info("音声データを処理・分析しています...")
+            # サンプリングレート変換
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=webrtc_ctx.audio_receiver.format.sample_rate, 
+                new_freq=RECORDING_SAMPLING_RATE
+            )
+            final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()
+            
+            # --- AI分析実行 ---
+            st.session_state["text"] = transcribe_audio(final_waveform_16k, models)
+            st.session_state["audio_emotion"] = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
+            if st.session_state["text"]:
+                st.session_state["text_emotion"] = analyze_text_emotion(st.session_state["text"], models)
+        
+        # 状態をリセット
+        st.session_state.audio_buffer = np.array([], dtype=np.float32)
+        st.session_state.all_frames = []
+        st.session_state.realtime_text = ""
+        
+        # st.experimental_rerun() は不要。webrtc_ctxの状態変化で自動的に再実行される。
+        # 再実行されると、下の analyze_audio_emotion が呼ばれる
+        time.sleep(0.5) # 念のため描画の時間を確保
+        st.rerun()
 
-                # フレームを結合してNumpy配列に変換
-                sound = np.concatenate([f.to_ndarray() for f in audio_frames])
-                sound = sound.mean(axis=1) # ステレオをモノラルに
-                
-                # サンプリングレートをWhisper用に変換
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=webrtc_ctx.audio_receiver.format.sample_rate, 
-                    new_freq=RECORDING_SAMPLING_RATE
-                )
-                waveform_16k = resampler(torch.from_numpy(sound).float()).numpy()
+    else:
+        # 初期状態または停止後の状態
+        status_indicator.info("▶️ 『START』を押して録音を開始してください。")
 
-                # --- AI分析実行 ---
-                st.session_state["text"] = transcribe_audio(waveform_16k, models)
-                st.session_state["audio_emotion"] = analyze_audio_emotion(waveform_16k, RECORDING_SAMPLING_RATE, models)
-                if st.session_state["text"]:
-                    st.session_state["text_emotion"] = analyze_text_emotion(st.session_state["text"], models)
-                
-                status_indicator.success("分析が完了しました！")
-                # 再実行して結果を表示
-                st.experimental_rerun()
-
-        except Exception as e:
-            st.error(f"エラーが発生しました: {e}")
 
 # ==========================
 # 📁 アップロード音声モード

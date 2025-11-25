@@ -11,6 +11,7 @@ from faster_whisper import WhisperModel
 import av
 import os
 import queue
+import time
 
 # ==========================
 # 定数と設定
@@ -108,52 +109,56 @@ st.title("🎵 AI感情分析 ＆ Spotifyプレイリスト検索")
 
 models = load_models()
 sp = get_spotify_client()
-
 if not sp:
     st.stop()
 
-input_mode = st.radio("音声入力方法を選んでください：", ["🎙️ マイクで話す", "📁 音声ファイルをアップロード"], horizontal=True)
-
+# --- セッションステートの初期化 ---
 if "text" not in st.session_state:
-    st.session_state.update({"text": "", "audio_emotion": None, "text_emotion": None, "audio_frames": []})
+    st.session_state.text = ""
+if "audio_emotion" not in st.session_state:
+    st.session_state.audio_emotion = None
+if "text_emotion" not in st.session_state:
+    st.session_state.text_emotion = None
 
+input_mode = st.radio("音声入力方法を選んでください：", ["🎙️ マイクで話す", "📁 音声ファイルをアップロード"], horizontal=True, key="input_mode")
+
+# --- マイク入力モード ---
 if input_mode == "🎙️ マイクで話す":
-    st.info("1. STARTを押す → 2. マイクを許可する → 3. 話す → 4. STOPを押す")
-    
+    st.info("1. STARTを押す → 2. マイクを許可する → 3. 話す → 4. STOPを押すと分析が始まります。")
+
+    if "audio_frames" not in st.session_state:
+        st.session_state.audio_frames = []
+
+    def audio_frame_callback(frame: av.AudioFrame):
+        st.session_state.audio_frames.append(frame.to_ndarray())
+        print(f"★DEBUG: Audio frame received. Total frames: {len(st.session_state.audio_frames)}")
+
     webrtc_ctx = webrtc_streamer(
         key="audio-recorder",
         mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=1024,
+        audio_frame_callback=audio_frame_callback,
         media_stream_constraints={"video": False, "audio": True},
+        # audio_receiver_sizeを大きくしてQueue overflowを防ぐ
+        audio_receiver_size=4096, 
     )
 
     status_indicator = st.empty()
-    
-    was_playing = st.session_state.get("is_playing", False)
-    is_playing = webrtc_ctx.state.playing
-    st.session_state["is_playing"] = is_playing
 
-    if is_playing:
-        status_indicator.info("🎙️ 録音中... 音声フレームを収集しています。")
-        if "audio_frames" not in st.session_state:
-            st.session_state.audio_frames = []
+    if webrtc_ctx.state.playing:
+        status_indicator.info("🎙️ 録音中...")
+        # 録音が始まったら、前の録音データをクリアする
+        if "analysis_done" not in st.session_state or st.session_state.analysis_done == True:
+             st.session_state.audio_frames = []
+             st.session_state.analysis_done = False
+    else:
+        status_indicator.info("▶️ 『START』で録音開始")
         
-        # コールバックの代わりにフレームを直接取得
-        if webrtc_ctx.audio_receiver:
-            try:
-                frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
-                for frame in frames:
-                    st.session_state.audio_frames.append(frame.to_ndarray())
-            except queue.Empty:
-                pass # タイムアウトは無視
-
-    if not is_playing and was_playing:
-        status_indicator.info("録音停止。分析を開始します...")
-        
-        frames = st.session_state.get("audio_frames", [])
-        if len(frames) > 0:
+        # --- 録音停止後の処理 ---
+        if "analysis_done" in st.session_state and not st.session_state.analysis_done and len(st.session_state.audio_frames) > 0:
             with st.spinner("音声データを処理・分析しています..."):
-                sound_chunks = [frame.mean(axis=1) for frame in frames] # モノラル化
+                frames = st.session_state.audio_frames
+                
+                sound_chunks = [frame.mean(axis=1) for frame in frames]
                 final_waveform = np.concatenate(sound_chunks)
                 
                 resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
@@ -163,12 +168,12 @@ if input_mode == "🎙️ マイクで話す":
                 st.session_state.audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
                 if st.session_state.text:
                     st.session_state.text_emotion = analyze_text_emotion(st.session_state.text, models)
-            
-            st.session_state.audio_frames = []
-            st.rerun() # 結果を表示するために再実行
-        else:
-            status_indicator.warning("音声が録音されなかったようです。")
 
+            st.session_state.audio_frames = []
+            st.session_state.analysis_done = True
+            st.rerun()
+
+# --- アップロード音声モード ---
 elif input_mode == "📁 音声ファイルをアップロード":
     uploaded_file = st.file_uploader("音声ファイル(mp3, wav) をアップロードしてください", type=["wav", "mp3"])
 
@@ -185,7 +190,7 @@ elif input_mode == "📁 音声ファイルをアップロード":
         st.rerun()
 
 # --- 結果表示 ---
-if st.session_state.get("text") or st.session_state.get("audio_emotion"):
+if st.session_state.text or st.session_state.audio_emotion:
     st.markdown("---")
     st.header("分析結果")
     col1, col2, col3 = st.columns(3)
@@ -212,7 +217,9 @@ if st.session_state.get("text") or st.session_state.get("audio_emotion"):
     if primary_emotion_label and sp:
         search_spotify(primary_emotion_label, sp)
 
-    # 結果を表示したらクリアする
-    st.session_state.text = ""
-    st.session_state.audio_emotion = None
-    st.session_state.text_emotion = None
+    # 結果をクリアするためのボタン
+    if st.button("結果をクリア"):
+        st.session_state.text = ""
+        st.session_state.audio_emotion = None
+        st.session_state.text_emotion = None
+        st.rerun()

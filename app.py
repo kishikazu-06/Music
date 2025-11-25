@@ -9,10 +9,8 @@ import librosa
 from transformers import AutoFeatureExtractor, AutoModelForAudioClassification, AutoTokenizer, AutoModelForSequenceClassification
 from faster_whisper import WhisperModel
 import av
-import time
-import queue
-import tempfile
 import os
+import queue
 
 # ==========================
 # 定数と設定
@@ -117,74 +115,59 @@ if not sp:
 input_mode = st.radio("音声入力方法を選んでください：", ["🎙️ マイクで話す", "📁 音声ファイルをアップロード"], horizontal=True)
 
 if "text" not in st.session_state:
-    st.session_state.update({"text": "", "audio_emotion": None, "text_emotion": None})
+    st.session_state.update({"text": "", "audio_emotion": None, "text_emotion": None, "audio_frames": []})
 
 if input_mode == "🎙️ マイクで話す":
-    st.info("下の『START』を押してマイクに向かって話してください。")
+    st.info("1. STARTを押す → 2. マイクを許可する → 3. 話す → 4. STOPを押す")
     
-    if "audio_frames_queue" not in st.session_state:
-        st.session_state.audio_frames_queue = queue.Queue()
-
-    def audio_frame_callback(frame: av.AudioFrame):
-        print(f"★DEBUG 1: Audio frame received: {frame.format.name} {frame.layout.name} {frame.samples}")
-        st.session_state.audio_frames_queue.put(frame.to_ndarray())
-
-    webrtc_ctx = webrtc_streamer(key="speech-to-text-realtime", mode=WebRtcMode.SENDONLY, audio_frame_callback=audio_frame_callback, media_stream_constraints={"video": False, "audio": True})
+    webrtc_ctx = webrtc_streamer(
+        key="audio-recorder",
+        mode=WebRtcMode.SENDONLY,
+        audio_receiver_size=1024,
+        media_stream_constraints={"video": False, "audio": True},
+    )
 
     status_indicator = st.empty()
-    realtime_text_display = st.empty()
+    
+    was_playing = st.session_state.get("is_playing", False)
+    is_playing = webrtc_ctx.state.playing
+    st.session_state["is_playing"] = is_playing
 
-    if webrtc_ctx.state.playing:
-        status_indicator.info("🎙️ 録音中...")
-        if "audio_buffer" not in st.session_state:
-            st.session_state.audio_buffer = np.array([], dtype=np.float32)
-        if "full_audio" not in st.session_state:
-            st.session_state.full_audio = np.array([], dtype=np.float32)
-
-        while webrtc_ctx.state.playing:
-            try:
-                frame_data = st.session_state.audio_frames_queue.get(timeout=1.0)
-                print(f"★DEBUG 2: Got frame from queue. Shape: {frame_data.shape}, Dtype: {frame_data.dtype}")
-                sound_chunk = frame_data.mean(axis=1)
-                st.session_state.audio_buffer = np.append(st.session_state.audio_buffer, sound_chunk)
-                st.session_state.full_audio = np.append(st.session_state.full_audio, sound_chunk)
-
-                buffer_len = len(st.session_state.audio_buffer)
-                threshold = 48000 * 1.5
-                print(f"★DEBUG 3: Current buffer length: {buffer_len}, Threshold: {threshold}")
-
-                if buffer_len > threshold:
-                    print("★DEBUG 4: --- Triggering transcription ---")
-                    resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
-                    waveform_16k = resampler(torch.from_numpy(st.session_state.audio_buffer).float()).numpy()
-                    text = transcribe_audio(waveform_16k, models)
-                    
-                    if "realtime_text" not in st.session_state:
-                        st.session_state.realtime_text = ""
-                    st.session_state.realtime_text += text
-                    realtime_text_display.markdown(f"**リアルタイム:** {st.session_state.realtime_text}")
-                    st.session_state.audio_buffer = np.array([], dtype=np.float32)
-            except queue.Empty:
-                continue
-
-        status_indicator.info("録音停止。最終分析を実行しています...")
-        if len(st.session_state.full_audio) > 0:
-            resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
-            final_waveform_16k = resampler(torch.from_numpy(st.session_state.full_audio).float()).numpy()
-
-            st.session_state.text = transcribe_audio(final_waveform_16k, models)
-            st.session_state.audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
-            if st.session_state.text:
-                st.session_state.text_emotion = analyze_text_emotion(st.session_state.text, models)
-
-        for key in ["audio_buffer", "full_audio", "realtime_text", "audio_frames_queue"]:
-            if key in st.session_state:
-                del st.session_state[key]
+    if is_playing:
+        status_indicator.info("🎙️ 録音中... 音声フレームを収集しています。")
+        if "audio_frames" not in st.session_state:
+            st.session_state.audio_frames = []
         
-        time.sleep(0.5)
-        st.rerun()
-    else:
-        status_indicator.info("▶️ 『START』を押して録音を開始してください。")
+        # コールバックの代わりにフレームを直接取得
+        if webrtc_ctx.audio_receiver:
+            try:
+                frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
+                for frame in frames:
+                    st.session_state.audio_frames.append(frame.to_ndarray())
+            except queue.Empty:
+                pass # タイムアウトは無視
+
+    if not is_playing and was_playing:
+        status_indicator.info("録音停止。分析を開始します...")
+        
+        frames = st.session_state.get("audio_frames", [])
+        if len(frames) > 0:
+            with st.spinner("音声データを処理・分析しています..."):
+                sound_chunks = [frame.mean(axis=1) for frame in frames] # モノラル化
+                final_waveform = np.concatenate(sound_chunks)
+                
+                resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
+                final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()
+                
+                st.session_state.text = transcribe_audio(final_waveform_16k, models)
+                st.session_state.audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
+                if st.session_state.text:
+                    st.session_state.text_emotion = analyze_text_emotion(st.session_state.text, models)
+            
+            st.session_state.audio_frames = []
+            st.rerun() # 結果を表示するために再実行
+        else:
+            status_indicator.warning("音声が録音されなかったようです。")
 
 elif input_mode == "📁 音声ファイルをアップロード":
     uploaded_file = st.file_uploader("音声ファイル(mp3, wav) をアップロードしてください", type=["wav", "mp3"])
@@ -192,21 +175,23 @@ elif input_mode == "📁 音声ファイルをアップロード":
     if uploaded_file:
         with st.spinner("音声ファイルを処理・分析しています..."):
             try:
-                waveform, sampling_rate = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
+                waveform, _ = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
                 st.session_state.text = transcribe_audio(waveform, models)
-                st.session_state.audio_emotion = analyze_audio_emotion(waveform, sampling_rate, models)
+                st.session_state.audio_emotion = analyze_audio_emotion(waveform, RECORDING_SAMPLING_RATE, models)
                 if st.session_state.text:
                     st.session_state.text_emotion = analyze_text_emotion(st.session_state.text, models)
             except Exception as e:
                 st.error(f"ファイル処理中にエラーが発生しました: {e}")
+        st.rerun()
 
+# --- 結果表示 ---
 if st.session_state.get("text") or st.session_state.get("audio_emotion"):
     st.markdown("---")
     st.header("分析結果")
     col1, col2, col3 = st.columns(3)
     with col1:
         st.subheader("🗣️ 文字起こし結果")
-        st.write(st.session_state.text)
+        st.write(st.session_state.text or "（なし）")
     with col2:
         st.subheader("🔊 音声の感情")
         if st.session_state.audio_emotion:
@@ -226,3 +211,8 @@ if st.session_state.get("text") or st.session_state.get("audio_emotion"):
         primary_emotion_label = st.session_state["text_emotion"][0]["label"]
     if primary_emotion_label and sp:
         search_spotify(primary_emotion_label, sp)
+
+    # 結果を表示したらクリアする
+    st.session_state.text = ""
+    st.session_state.audio_emotion = None
+    st.session_state.text_emotion = None

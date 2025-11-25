@@ -100,9 +100,14 @@ def analyze_text_emotion(text, models):
     ]
 
 def transcribe_audio(waveform, models, lang="ja"):
+    st.write(f"transcribe_audio called with waveform shape: {waveform.shape}, lang: {lang}")
     model = models["whisper_model"]
-    segments, _ = model.transcribe(waveform, beam_size=5, language=lang)
-    return "".join([segment.text for segment in segments])
+    segments, info = model.transcribe(waveform, beam_size=5, language=lang)
+    transcribed_text = "".join([segment.text for segment in segments])
+    st.write(f"Whisper transcription info: {info}")
+    st.write(f"Whisper raw segments: {list(segments)}") # segmentsはイテレータなのでリストに変換
+    st.write(f"Transcribed text (inside function): '{transcribed_text}'")
+    return transcribed_text
 
 # ==========================
 # Spotify連携
@@ -227,6 +232,55 @@ if input_mode == "🎙️ マイクで話す":
                         search_spotify(primary, sp)
 
             st.session_state.audio_buffer = []  # クリア
+    st.info("🎙️ 録音中... STOPで分析開始")
+    
+    # ログ出力
+    st.write("--- Debug Info (マイク入力) ---")
+    st.write(f"webrtc_ctx.state.playing: {webrtc_ctx.state.playing}")
+
+    if not webrtc_ctx.state.playing:
+        if "audio_buffer" in st.session_state and len(st.session_state.audio_buffer) > 0:
+            with st.spinner("音声を分析しています..."):
+                final_waveform = np.concatenate(st.session_state.audio_buffer)
+                st.write(f"Raw waveform shape: {final_waveform.shape}, dtype: {final_waveform.dtype}")
+
+                # リサンプリング
+                resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=RECORDING_SAMPLING_RATE)
+                final_waveform_16k = resampler(torch.from_numpy(final_waveform).float()).numpy()
+                st.write(f"Resampled waveform shape: {final_waveform_16k.shape}, dtype: {final_waveform_16k.dtype}")
+
+                final_waveform_16k = force_min_length(final_waveform_16k)
+                st.write(f"After force_min_length waveform shape: {final_waveform_16k.shape}")
+
+                # 分析
+                st.write("Calling transcribe_audio...")
+                text = transcribe_audio(final_waveform_16k, models)
+                st.write(f"Transcription result: '{text}'")
+                
+                audio_emotion = analyze_audio_emotion(final_waveform_16k, RECORDING_SAMPLING_RATE, models)
+                text_emotion = analyze_text_emotion(text, models) if text else None
+
+                # 表示
+                text_display.write(text or "（なし）")
+                if audio_emotion:
+                    top = max(audio_emotion, key=lambda x: x["score"])
+                    audio_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
+                if text_emotion:
+                    top = max(text_emotion, key=lambda x: x["score"])
+                    text_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
+
+                primary = (
+                    max(audio_emotion, key=lambda x: x["score"])["label"]
+                    if audio_emotion else (
+                        max(text_emotion, key=lambda x: x["score"])["label"]
+                        if text_emotion else None
+                    )
+                )
+                if primary:
+                    with playlist_display:
+                        search_spotify(primary, sp)
+
+            st.session_state.audio_buffer = []  # クリア
     else:
         # 録音中
         if "audio_buffer" not in st.session_state:
@@ -243,8 +297,9 @@ if input_mode == "🎙️ マイクで話す":
                 else:
                     mono = arr
                 st.session_state.audio_buffer.append(mono.astype(np.float32))
+            st.write(f"Current audio_buffer size: {len(st.session_state.audio_buffer)}")
         except queue.Empty:
-            pass
+            st.write("Audio queue empty.")
 
 else:
     uploaded_file = st.file_uploader("音声ファイル(mp3, wav) をアップロード", type=["wav", "mp3"])
@@ -253,26 +308,9 @@ else:
         with st.spinner("音声を分析しています..."):
             waveform, _ = librosa.load(uploaded_file, sr=RECORDING_SAMPLING_RATE, mono=True)
             waveform = force_min_length(waveform)
+            st.write("--- Debug Info (ファイルアップロード) ---")
+            st.write(f"Uploaded waveform shape: {waveform.shape}, dtype: {waveform.dtype}")
 
+            st.write("Calling transcribe_audio...")
             text = transcribe_audio(waveform, models)
-            audio_emotion = analyze_audio_emotion(waveform, RECORDING_SAMPLING_RATE, models)
-            text_emotion = analyze_text_emotion(text, models) if text else None
-
-            text_display.write(text or "（なし）")
-            if audio_emotion:
-                top = max(audio_emotion, key=lambda x: x["score"])
-                audio_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
-            if text_emotion:
-                top = max(text_emotion, key=lambda x: x["score"])
-                text_emotion_display.success(f"**{top['label']}** ({top['score']:.2f})")
-
-            primary = (
-                max(audio_emotion, key=lambda x: x["score"])["label"]
-                if audio_emotion else (
-                    max(text_emotion, key=lambda x: x["score"])["label"]
-                    if text_emotion else None
-                )
-            )
-            if primary:
-                with playlist_display:
-                    search_spotify(primary, sp)
+            st.write(f"Transcription result: '{text}'")

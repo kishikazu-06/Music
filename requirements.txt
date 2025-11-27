@@ -13,3 +13,5 @@ soundfile
 faster-whisper
 numpy
 sounddevice
+python-dotenv
+

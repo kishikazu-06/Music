@@ -7,7 +7,14 @@ from typing import Optional, List, Dict
 
 import numpy as np
 import streamlit as st
-import sounddevice as sd
+
+try:
+    import sounddevice as sd
+    SOUNDDEVICE_AVAILABLE = True
+except ImportError:
+    SOUNDDEVICE_AVAILABLE = False
+    sd = None
+
 import librosa
 import torch
 import torchaudio
@@ -224,6 +231,10 @@ def search_spotify_and_render(emotion_label: str, sp: spotipy.Spotify):
 # 録音スレッド（既に動作するものを流用）
 # --------------------------
 def record_audio_thread(audio_buffer: list, stop_event: threading.Event):
+    if not SOUNDDEVICE_AVAILABLE:
+        print("sounddeviceが利用できません")
+        return
+
     def callback(indata, frames, time, status):
         if status:
             print("InputStream status:", status)
@@ -273,19 +284,25 @@ def main():
         st.write("最低録音長は 1 秒です（自動でパディング）")
 
     # 録音操作
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🎤 録音開始", disabled=st.session_state.recording):
-            st.session_state.recording = True
-            st.session_state.audio_buffer = []
-            st.session_state.stop_event.clear()
-            threading.Thread(target=record_audio_thread, args=(st.session_state.audio_buffer, st.session_state.stop_event), daemon=True).start()
-            st.rerun()
-    with col2:
-        if st.button("⏹ 録音停止", disabled=not st.session_state.recording):
-            st.session_state.stop_event.set()
-            st.session_state.recording = False
-            st.rerun()
+    if not SOUNDDEVICE_AVAILABLE:
+        st.error("⚠️ **sounddeviceライブラリがインストールされていません**")
+        st.info("録音機能を使用するには、以下のコマンドでインストールしてください：")
+        st.code("pip install sounddevice", language="bash")
+        st.info("Windowsの場合、追加でPortAudioも必要になることがあります。")
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🎤 録音開始", disabled=st.session_state.recording):
+                st.session_state.recording = True
+                st.session_state.audio_buffer = []
+                st.session_state.stop_event.clear()
+                threading.Thread(target=record_audio_thread, args=(st.session_state.audio_buffer, st.session_state.stop_event), daemon=True).start()
+                st.rerun()
+        with col2:
+            if st.button("⏹ 録音停止", disabled=not st.session_state.recording):
+                st.session_state.stop_event.set()
+                st.session_state.recording = False
+                st.rerun()
 
     if st.session_state.recording:
         st.info("録音中... 話したら STOP を押してください。")

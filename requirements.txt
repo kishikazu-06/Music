@@ -12,3 +12,4 @@ librosa
 soundfile
 faster-whisper
 numpy
+sounddevice

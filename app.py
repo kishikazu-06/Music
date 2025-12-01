@@ -29,7 +29,7 @@ load_dotenv()
 # --------------------------
 SAMPLE_RATE = 16000  # アプリ内で扱う基本サンプルレート（Whisper 用）
 MIN_AUDIO_LEN = SAMPLE_RATE  # 最低 1 秒分を保証
-WHISPER_SIZE = "small"  # 必要なら small/medium/large-v3 等に変更
+WHISPER_SIZE = "tiny"  # 必要なら small/medium/large-v3 等に変更
 SPOTIPY_CLIENT_ID = os.environ.get("SPOTIPY_CLIENT_ID")
 SPOTIPY_CLIENT_SECRET = os.environ.get("SPOTIPY_CLIENT_SECRET")
 

@@ -9,6 +9,3 @@ spotipy
 python-dotenv
 pydub
 numpy
-libportaudio2                                                                                                      │
-portaudio19-dev                                                                                                    │
-ffmpeg 

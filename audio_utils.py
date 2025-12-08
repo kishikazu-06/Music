@@ -12,7 +12,7 @@ class AudioProcessor:
     def __init__(self):
         # ASR Model
         print("Loading Whisper model...")
-        self.asr_model = WhisperModel("small", device="cpu", compute_type="int8") # Use small/cpu for compatibility
+        self.asr_model = WhisperModel("small", device="cpu", compute_type="int8") # Use base/cpu for speed
         
         # Emotion Model
         print("Loading Hubert model...")
@@ -24,15 +24,9 @@ class AudioProcessor:
         # usually: neu, hap, ang, sad
         self.id2label = self.emotion_model.config.id2label
         
-        # Text Translation & Emotion Models
-        print("Loading Text Translation & Emotion models...")
-        try:
-            self.translator = pipeline("translation", model="Helsinki-NLP/opus-mt-ja-en")
-            self.text_emotion_classifier = pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-emotion", top_k=1)
-        except Exception as e:
-            print(f"Warning: Failed to load text models: {e}")
-            self.translator = None
-            self.text_emotion_classifier = None
+        # Text Translation & Emotion Models (Lazy Init)
+        self.translator = None
+        self.text_emotion_classifier = None
 
     def transcribe(self, audio_path):
         """
@@ -65,8 +59,22 @@ class AudioProcessor:
         Predicts emotion from Japanese text (translates to EN first).
         Returns mapped label: 'neu', 'hap', 'sad', 'ang'
         """
-        if not self.translator or not self.text_emotion_classifier or not text_ja:
-            return 'neu' # Default fallback
+
+        if not text_ja:
+            return 'neu'
+            
+        # Lazy Load
+        if self.translator is None or self.text_emotion_classifier is None:
+            print("Loading Text Translation & Emotion models (Lazy)...")
+            try:
+                self.translator = pipeline("translation", model="Helsinki-NLP/opus-mt-ja-en")
+                self.text_emotion_classifier = pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-emotion", top_k=1)
+            except Exception as e:
+                print(f"Warning: Failed to load text models: {e}")
+                return 'neu'
+
+        if not self.translator or not self.text_emotion_classifier:
+             return 'neu'
             
         try:
             # 1. Translate JA -> EN

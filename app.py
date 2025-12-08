@@ -46,7 +46,7 @@ st.write("マイクに向かって話しかけてください。あなたの声�
 def load_audio_processor():
     return AudioProcessor()
 
-# @st.cache_resource  <-- Caching removed to force reload for .env updates
+@st.cache_resource
 def load_spotify_client():
     return SpotifyClient()
 

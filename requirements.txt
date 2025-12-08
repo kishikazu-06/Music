@@ -1,11 +1,11 @@
 streamlit
-sounddevice
-librosa
-torch
-torchaudio
-faster_whisper
+audio-recorder-streamlit
+faster-whisper
 transformers
+torch
+librosa
 spotipy
 python-dotenv
-pydub
 numpy
+scipy
+soundfile
